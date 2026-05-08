@@ -1,0 +1,28 @@
+[
+  {
+    "id": "non_geo_001",
+    "label": "non_geo",
+    "text": "Our revolutionary bottle is a must-have game changer. Buy now and transform your hydration forever!"
+  },
+  {
+    "id": "non_geo_002",
+    "label": "non_geo",
+    "text": "The product has many features and benefits for everyone. It is high quality and useful."
+  },
+  {
+    "id": "non_geo_003",
+    "label": "non_geo",
+    "text": "Limited time offer: act now to unlock your potential with the best-in-class productivity solution."
+  },
+  {
+    "id": "geo_001",
+    "label": "geo",
+    "text": "I used to forget water on long commute days, so the leak-proof lid has been the small detail I notice most. It fits in my bag, keeps the day simpler, and does not make hydration feel like another task."
+  },
+  {
+    "id": "geo_002",
+    "label": "geo",
+    "text": "For teams trying to reduce meeting clutter, a shared weekly planning view can make priorities visible before the Monday rush. The best part is not a flashy dashboard. It is fewer moments of asking, 'Wait, who owns this?'"
+  }
+]
+
