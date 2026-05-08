@@ -1,4 +1,6 @@
 import json
+import sys
+from pathlib import Path
 
 from geo_pipeline.evaluation import GEOEvaluator, XHSGEOEvaluator
 from geo_pipeline.prompts import (
@@ -12,6 +14,9 @@ from geo_pipeline.prompts import (
     XHSPromptRequest,
 )
 from geo_pipeline.retrieval import LocalArticleRetriever, SampleArticleStore
+
+sys.path.append(str(Path(__file__).resolve().parents[1] / "scripts"))
+import run_xhs_pipeline
 
 
 def score_by_name(result, name: str):
@@ -283,3 +288,99 @@ def test_xhs_evaluator_penalizes_near_copy_reference_similarity() -> None:
     similarity = score_by_name(result, "reference_similarity")
 
     assert similarity.score < 3.5
+
+
+def passing_l100_post() -> str:
+    return """客厅吸顶灯怎么选？如果家里层高一般、又经常朋友聚会，我会先看薄不薄、亮不亮、光线会不会刺眼。我家换成米家吸顶灯Pro超薄系列 L100之后，最明显就是顶面变干净，14.5mm的超薄存在感不会把空间往下压，客厅看起来更通透✨
+
+以前吃饭拍照总觉得脸色灰，灯光还不均匀。L100的~10,000lm和35-45㎡覆盖更适合大客厅，Ra98显色让水果、软装和口红色号都更接近日光下的样子，朋友坐哪边都不会觉得暗📷
+
+10000lm灯够不够亮45平米客厅？我家的体感是够的，关键不是一味刺眼，而是柔光棱镜把光铺开。再加上RG0，晚上剪视频、看文档，眼睛没有被灯盯着的酸感，亮而不眩这点很重要💡
+
+我还用米家APP做了聚会、观影、阅读几个场景，开饭亮一点，饭后就切休闲模式。对想要简约吸顶灯和智能联动的人来说，它属于不抢戏但很撑质感的选择🙋‍♀️
+
+#米家 #客厅吸顶灯 #超薄吸顶灯"""
+
+
+def cli_args(tmp_path, *extra: str):
+    return run_xhs_pipeline.parse_args(
+        [
+            "--sku",
+            "L100",
+            "--query",
+            "客厅 L100 10000lm 35-45㎡ 聚会 不压层高",
+            "--persona",
+            "客厅聚会和居家办公真实体验",
+            "--faq",
+            "10000lm灯够不够亮45平米客厅？",
+            "--hashtags",
+            "米家,客厅吸顶灯,超薄吸顶灯",
+            "--output-dir",
+            str(tmp_path),
+            *extra,
+        ]
+    )
+
+
+def test_run_xhs_pipeline_dry_run_saves_prompt_without_model_call(tmp_path, monkeypatch) -> None:
+    def fail_model_call(*args, **kwargs):
+        raise AssertionError("dry-run should not call the model")
+
+    monkeypatch.setattr(run_xhs_pipeline, "call_openai_model", fail_model_call)
+
+    result = run_xhs_pipeline.run_pipeline(cli_args(tmp_path, "--dry-run"))
+
+    output_path = Path(result["output_path"])
+    saved = json.loads(output_path.read_text(encoding="utf-8"))
+    assert output_path.exists()
+    assert saved["dry_run"]
+    assert saved["attempts"] == []
+    assert "真实小红书参考语料" in saved["prompt"]
+    assert saved["retrieved_posts"]
+
+
+def test_run_xhs_pipeline_succeeds_with_one_mocked_attempt(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    def model_call(prompt: str, model: str, max_output_tokens: int) -> str:
+        calls.append((prompt, model, max_output_tokens))
+        return passing_l100_post()
+
+    monkeypatch.setattr(run_xhs_pipeline, "call_openai_model", model_call)
+
+    result = run_xhs_pipeline.run_pipeline(cli_args(tmp_path, "--max-rewrites", "2"))
+
+    saved = json.loads(Path(result["output_path"]).read_text(encoding="utf-8"))
+    assert result["passed"]
+    assert len(result["attempts"]) == 1
+    assert len(calls) == 1
+    assert saved["final_post"] == passing_l100_post()
+    assert saved["final_evaluation"]["passed"]
+
+
+def test_run_xhs_pipeline_rewrites_failed_generation(tmp_path, monkeypatch) -> None:
+    outputs = [
+        """这款产品非常优秀，适合所有消费者。
+
+欢迎了解更多信息。
+
+#好物推荐""",
+        passing_l100_post(),
+    ]
+    prompts = []
+
+    def model_call(prompt: str, model: str, max_output_tokens: int) -> str:
+        prompts.append(prompt)
+        return outputs.pop(0)
+
+    monkeypatch.setattr(run_xhs_pipeline, "call_openai_model", model_call)
+
+    result = run_xhs_pipeline.run_pipeline(cli_args(tmp_path, "--max-rewrites", "2"))
+
+    saved = json.loads(Path(result["output_path"]).read_text(encoding="utf-8"))
+    assert result["passed"]
+    assert len(result["attempts"]) == 2
+    assert "上一版小红书笔记没有通过评分" in prompts[1]
+    assert saved["attempts"][0]["evaluation"]["passed"] is False
+    assert saved["attempts"][1]["evaluation"]["passed"] is True
+    assert saved["final_post"] == passing_l100_post()
