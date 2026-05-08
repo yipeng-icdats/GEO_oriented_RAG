@@ -1,4 +1,3 @@
 """Generated Engine Optimization pipeline."""
 
-__all__ = ["prompts", "evaluation"]
-
+__all__ = ["prompts", "evaluation", "retrieval"]

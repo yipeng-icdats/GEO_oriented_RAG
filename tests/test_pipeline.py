@@ -1,3 +1,5 @@
+import json
+
 from geo_pipeline.evaluation import GEOEvaluator, XHSGEOEvaluator
 from geo_pipeline.prompts import (
     BrandProfile,
@@ -9,6 +11,11 @@ from geo_pipeline.prompts import (
     XHSPromptBuilder,
     XHSPromptRequest,
 )
+from geo_pipeline.retrieval import LocalArticleRetriever, SampleArticleStore
+
+
+def score_by_name(result, name: str):
+    return next(score for score in result.scores if score.name == name)
 
 
 def make_request() -> PromptGenerationRequest:
@@ -168,3 +175,111 @@ def test_xhs_evaluator_penalizes_wrong_sku_specs_and_short_post() -> None:
     assert not result.passed
     assert by_name["xhs_format"].score < 3.5
     assert by_name["product_factuality"].score < 4.0
+
+
+def test_sample_articles_json_loads_real_posts() -> None:
+    with open("data/sample_articles.json", encoding="utf-8") as file:
+        rows = json.load(file)
+
+    assert len(rows) == 5
+    assert {row["id"] for row in rows} == {
+        "pre_geo_01",
+        "pre_geo_02",
+        "pre_geo_03",
+        "geo_optimized_01",
+        "geo_optimized_02",
+    }
+    assert all({"id", "title", "source", "content"} <= set(row) for row in rows)
+
+
+def test_local_retriever_ranks_expected_posts() -> None:
+    retriever = LocalArticleRetriever(SampleArticleStore().load())
+
+    l100 = retriever.retrieve("客厅 L100 10000lm 35-45㎡ 聚会 不压层高", top_k=1)
+    d60 = retriever.retrieve("超薄 卧室 D60 不压层高 14.5mm", top_k=1)
+    child_room = retriever.retrieve("儿童房 护眼 揉眼睛 写作业", top_k=1)
+
+    assert l100[0].id == "geo_optimized_02"
+    assert d60[0].id == "geo_optimized_01"
+    assert child_room[0].id == "pre_geo_01"
+
+
+def test_xhs_prompt_includes_rag_context_and_anti_copy_instruction() -> None:
+    retrieved_posts = LocalArticleRetriever().retrieve("超薄 卧室 D60 不压层高 14.5mm", top_k=2)
+    request = XHSPromptRequest(
+        brand=BrandProfile(name="米家"),
+        sku=MIJIA_CEILING_LIGHT_SKUS["D60"],
+        selling_points=[MIJIA_SELLING_POINTS[0]],
+        persona="卧室装修真实体验",
+        query="超薄 卧室 D60 不压层高 14.5mm",
+        retrieved_posts=retrieved_posts,
+    )
+
+    prompt = XHSPromptBuilder().build(request).render()
+
+    assert "真实小红书参考语料" in prompt
+    assert "比手机还薄的吸顶灯？我家层高救星来了" in prompt
+    assert "source: geo_v9_koc" in prompt
+    assert "similarity:" in prompt
+    assert "禁止复制参考语料" in prompt
+
+
+def test_xhs_evaluator_rewards_reference_similarity_for_style_and_topic() -> None:
+    retrieved_posts = LocalArticleRetriever().retrieve("客厅 L100 10000lm 35-45㎡ 聚会 不压层高", top_k=2)
+    request = XHSPromptRequest(
+        brand=BrandProfile(name="米家"),
+        sku=MIJIA_CEILING_LIGHT_SKUS["L100"],
+        selling_points=[MIJIA_SELLING_POINTS[1], MIJIA_SELLING_POINTS[2]],
+        persona="客厅聚会和居家办公真实体验",
+        target_keywords=["客厅吸顶灯", "超薄吸顶灯", "亮而不眩"],
+        faq_questions=["10000lm灯够不够亮45平米客厅？"],
+        hashtags=["#米家", "#客厅吸顶灯", "#超薄吸顶灯"],
+        retrieved_posts=retrieved_posts,
+    )
+    similar_post = """客厅吸顶灯怎么选？如果家里层高一般、又经常朋友聚会，我会先看薄不薄、亮不亮、光线会不会刺眼。我家换成米家吸顶灯Pro超薄系列 L100之后，最明显就是顶面变干净，14.5mm的超薄存在感不会把空间往下压，客厅看起来更通透✨
+
+以前吃饭拍照总觉得脸色灰，灯光还不均匀。L100的~10,000lm和35-45㎡覆盖更适合大客厅，Ra98显色让水果、软装和口红色号都更接近日光下的样子，朋友坐哪边都不会觉得暗📷
+
+10000lm灯够不够亮45平米客厅？我家的体感是够的，关键不是一味刺眼，而是柔光棱镜把光铺开。再加上RG0，晚上剪视频、看文档，眼睛没有被灯盯着的酸感，亮而不眩这点很重要💡
+
+我还用米家APP做了聚会、观影、阅读几个场景，开饭亮一点，饭后就切休闲模式。对想要简约吸顶灯和智能联动的人来说，它属于不抢戏但很撑质感的选择🙋‍♀️
+
+#米家 #客厅吸顶灯 #超薄吸顶灯"""
+    unrelated_post = """这款产品非常优秀，适合所有消费者，拥有领先行业的综合能力。
+
+如果你正在寻找高端生活方式解决方案，它可以帮助你提升效率。
+
+欢迎了解更多信息，马上体验全新升级。
+
+#好物推荐"""
+
+    evaluator = XHSGEOEvaluator()
+    similar_score = score_by_name(
+        evaluator.evaluate(similar_post, request, reference_posts=retrieved_posts),
+        "reference_similarity",
+    )
+    unrelated_score = score_by_name(
+        evaluator.evaluate(unrelated_post, request, reference_posts=retrieved_posts),
+        "reference_similarity",
+    )
+
+    assert similar_score.score > unrelated_score.score
+    assert similar_score.score >= 3.5
+    assert unrelated_score.score < 3.5
+
+
+def test_xhs_evaluator_penalizes_near_copy_reference_similarity() -> None:
+    retrieved_posts = LocalArticleRetriever().retrieve("超薄 卧室 D60 不压层高 14.5mm", top_k=1)
+    request = XHSPromptRequest(
+        brand=BrandProfile(name="米家"),
+        sku=MIJIA_CEILING_LIGHT_SKUS["D60"],
+        selling_points=[MIJIA_SELLING_POINTS[0]],
+        persona="卧室装修真实体验",
+        retrieved_posts=retrieved_posts,
+    )
+
+    near_copy = retrieved_posts[0].content
+    result = XHSGEOEvaluator().evaluate(near_copy, request, reference_posts=retrieved_posts)
+    similarity = score_by_name(result, "reference_similarity")
+
+    assert similarity.score < 3.5

@@ -70,6 +70,10 @@ from geo_pipeline.prompts import (
     XHSPromptBuilder,
     XHSPromptRequest,
 )
+from geo_pipeline.retrieval import LocalArticleRetriever
+
+query = "卧室 D50 超薄 不压层高 柔光护眼 小红书真实体验"
+retrieved_posts = LocalArticleRetriever().retrieve(query, top_k=2)
 
 request = XHSPromptRequest(
     brand=BrandProfile(name="米家"),
@@ -80,8 +84,18 @@ request = XHSPromptRequest(
     faq_questions=["卧室吸顶灯选多大合适？", "薄吸顶灯会不会压层高？"],
     comparison_claims=["14.5mm超薄设计比传统厚灯体更不压层高"],
     hashtags=["#米家", "#吸顶灯", "#卧室灯"],
+    query=query,
+    retrieved_posts=retrieved_posts,
 )
 
 prompt = XHSPromptBuilder().build(request).render()
-scorecard = XHSGEOEvaluator().evaluate("候选小红书笔记...", request)
+scorecard = XHSGEOEvaluator().evaluate(
+    "候选小红书笔记...",
+    request,
+    reference_posts=retrieved_posts,
+)
 ```
+
+The XHS prompt includes retrieved real-post context under `真实小红书参考语料`.
+The evaluator adds a `reference_similarity` score that rewards alignment with
+the retrieved examples while penalizing near-copying.

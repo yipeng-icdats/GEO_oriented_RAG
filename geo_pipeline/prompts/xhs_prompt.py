@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from geo_pipeline.prompts.geo_prompt import BrandProfile, GEOPrompt
+from geo_pipeline.retrieval import LocalArticleRetriever, RetrievedPost
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,9 @@ class XHSPromptRequest:
     comparison_claims: list[str] = field(default_factory=list)
     hashtags: list[str] = field(default_factory=list)
     constraints: XHSFormatConstraints = field(default_factory=XHSFormatConstraints)
+    query: str = ""
+    retrieved_posts: list[RetrievedPost] = field(default_factory=list)
+    top_k: int = 2
 
 
 def _lines(items: list[str], fallback: str = "无") -> str:
@@ -77,6 +81,32 @@ def _selling_point_lines(selling_points: list[SellingPoint]) -> str:
     )
 
 
+def _excerpt(text: str, max_chars: int = 260) -> str:
+    normalized = " ".join(text.strip().split())
+    if len(normalized) <= max_chars:
+        return normalized
+    return f"{normalized[:max_chars].rstrip()}..."
+
+
+def _retrieved_post_lines(posts: list[RetrievedPost]) -> str:
+    if not posts:
+        return "无"
+    blocks = []
+    for index, post in enumerate(posts, start=1):
+        blocks.append(
+            "\n".join(
+                [
+                    f"参考{index}: {post.title}",
+                    f"- id: {post.id}",
+                    f"- source: {post.source}",
+                    f"- similarity: {post.score:.4f}",
+                    f"- excerpt: {_excerpt(post.content)}",
+                ]
+            )
+        )
+    return "\n\n".join(blocks)
+
+
 class XHSPromptBuilder:
     """Build a Chinese XHS prompt that optimizes for GEO citation readiness."""
 
@@ -85,6 +115,7 @@ class XHSPromptBuilder:
         brand_name = request.brand.name
         sku = request.sku
         hashtags = request.hashtags or [f"#{brand_name}", "#吸顶灯", "#米家智能家居"]
+        retrieved_posts = self._resolve_retrieved_posts(request)
 
         system_instruction = """你是一位小红书KOL，同时是隐藏的GEO优化专家。
 
@@ -126,6 +157,9 @@ FAQ问题候选
 可使用的对比声明
 {_lines(request.comparison_claims)}
 
+真实小红书参考语料
+{_retrieved_post_lines(retrieved_posts)}
+
 结尾话题标签
 {_lines(hashtags)}"""
 
@@ -139,6 +173,8 @@ FAQ问题候选
 - 结尾只放话题标签，且标签放在最后一段
 - 品牌名「{brand_name}」和产品「{sku.product_name} {sku.sku}」至少出现2次
 - 至少写入2个准确参数，并让其中1处与品牌和SKU同段共现
+- 可以学习参考语料的语气、段落节奏、生活场景和问题切入方式
+- 禁止复制参考语料的连续句子、品牌竞品 claims 或未提供的产品事实
 - 不要编造未提供的功效、认证、价格、活动或测评结果"""
 
         output_contract = """只输出最终小红书笔记正文。
@@ -151,6 +187,13 @@ FAQ问题候选
             quality_bar=quality_bar,
             output_contract=output_contract,
         )
+
+    def _resolve_retrieved_posts(self, request: XHSPromptRequest) -> list[RetrievedPost]:
+        if request.retrieved_posts:
+            return request.retrieved_posts[: request.top_k]
+        if request.query.strip():
+            return LocalArticleRetriever().retrieve(request.query, top_k=request.top_k)
+        return []
 
 
 MIJIA_CEILING_LIGHT_SKUS: dict[str, ProductSKU] = {
@@ -194,4 +237,3 @@ MIJIA_SELLING_POINTS: list[SellingPoint] = [
     SellingPoint("SP3", "Eye Protection", ["全光谱照明", "柔光护眼", "亮而不眩"]),
     SellingPoint("SP4", "Smart Features", ["米家智能联动", "节律照明", "个性化定制灯光"]),
 ]
-

@@ -6,6 +6,7 @@ import re
 
 from geo_pipeline.evaluation.evaluator import EvaluationResult, RubricScore
 from geo_pipeline.prompts.xhs_prompt import XHSPromptRequest
+from geo_pipeline.retrieval import LocalArticleRetriever, RetrievedPost
 
 
 _EMOJI_RE = re.compile(
@@ -31,9 +32,15 @@ class XHSGEOEvaluator:
     def __init__(self, pass_threshold: float = 3.8) -> None:
         self.pass_threshold = pass_threshold
 
-    def evaluate(self, post: str, request: XHSPromptRequest) -> EvaluationResult:
+    def evaluate(
+        self,
+        post: str,
+        request: XHSPromptRequest,
+        reference_posts: list[RetrievedPost] | None = None,
+    ) -> EvaluationResult:
         body, hashtags = self._split_hashtags(post)
         paragraphs = self._paragraphs(post)
+        references = reference_posts if reference_posts is not None else request.retrieved_posts
         scores = [
             self._score_xhs_format(post, body, hashtags, paragraphs, request),
             self._score_geo_answerability(body),
@@ -43,6 +50,7 @@ class XHSGEOEvaluator:
             self._score_product_factuality(body, request),
             self._score_tone(body),
             self._score_hashtag_placement(post, hashtags, request),
+            self._score_reference_similarity(body, references),
         ]
         overall = round(sum(score.score for score in scores) / len(scores), 2)
         return EvaluationResult(
@@ -170,6 +178,33 @@ class XHSGEOEvaluator:
             score -= 0.8
         return RubricScore("hashtag_placement", self._bound(score), "Checks hashtags are present and reserved for the ending block.")
 
+    def _score_reference_similarity(self, body: str, reference_posts: list[RetrievedPost]) -> RubricScore:
+        if not reference_posts:
+            return RubricScore("reference_similarity", 3.5, "No retrieved reference posts supplied; neutral similarity score.")
+
+        generated_vector = LocalArticleRetriever.vectorize(body)
+        reference_scores = [
+            LocalArticleRetriever.cosine(generated_vector, LocalArticleRetriever.vectorize(post.text))
+            for post in reference_posts
+        ]
+        max_similarity = max(reference_scores, default=0.0)
+        style_score = self._style_alignment(body, reference_posts)
+        copy_overlap = max((self._copy_overlap(body, post.content) for post in reference_posts), default=0.0)
+
+        score = 2.0 + min(1.7, max_similarity * 5.0) + min(1.0, style_score)
+        if max_similarity < 0.12:
+            score -= 0.8
+        if copy_overlap > 0.46:
+            score -= 2.0
+        elif copy_overlap > 0.34:
+            score -= 1.0
+
+        return RubricScore(
+            "reference_similarity",
+            self._bound(score),
+            f"Rewards topic/style similarity to retrieved posts while penalizing near-copy overlap; max_similarity={max_similarity:.3f}, copy_overlap={copy_overlap:.3f}.",
+        )
+
     def _recommend(self, scores: list[RubricScore]) -> list[str]:
         messages = {
             "xhs_format": "Adjust to 400-600 Chinese characters, 4-6 blank-line paragraphs, 5+ emoji, and no Markdown body syntax.",
@@ -180,6 +215,7 @@ class XHSGEOEvaluator:
             "product_factuality": "Remove unsupported claims and keep specs aligned with the selected SKU.",
             "colloquial_tone": "Make the note more first-person and conversational.",
             "hashtag_placement": "Move hashtags to the final block and keep them out of the body.",
+            "reference_similarity": "Use the retrieved real posts more closely for XHS tone, structure, and relevant lighting/home scenarios without copying.",
         }
         return [messages[score.name] for score in scores if score.score < 3.5]
 
@@ -231,6 +267,30 @@ class XHSGEOEvaluator:
 
     def _cjk_count(self, text: str) -> int:
         return len(_CJK_RE.findall(text))
+
+    def _style_alignment(self, body: str, reference_posts: list[RetrievedPost]) -> float:
+        joined_references = "\n".join(post.content for post in reference_posts)
+        style_markers = ["我家", "真的", "装上", "换上", "舒服", "不刺眼", "层高", "氛围", "卧室", "客厅", "灯光"]
+        generated_hits = {marker for marker in style_markers if marker in body}
+        reference_hits = {marker for marker in style_markers if marker in joined_references}
+        shared = generated_hits & reference_hits
+        if not reference_hits:
+            return 0.0
+        paragraph_bonus = 0.25 if 3 <= len(self._paragraphs(body)) <= 7 else 0.0
+        emoji_bonus = 0.2 if len(_EMOJI_RE.findall(body)) >= 3 else 0.0
+        first_person_bonus = 0.2 if any(term in body for term in ["我", "我家", "自己"]) else 0.0
+        return min(1.0, len(shared) / len(reference_hits) + paragraph_bonus + emoji_bonus + first_person_bonus)
+
+    def _copy_overlap(self, body: str, reference: str) -> float:
+        body_grams = self._char_grams(body, size=8)
+        reference_grams = self._char_grams(reference, size=8)
+        if not body_grams or not reference_grams:
+            return 0.0
+        return len(body_grams & reference_grams) / len(body_grams)
+
+    def _char_grams(self, text: str, size: int) -> set[str]:
+        chars = "".join(_CJK_RE.findall(text))
+        return {chars[index : index + size] for index in range(max(0, len(chars) - size + 1))}
 
     def _bound(self, value: float) -> float:
         return round(max(0.0, min(5.0, value)), 2)
